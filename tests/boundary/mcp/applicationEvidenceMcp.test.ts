@@ -259,12 +259,14 @@ async function runInlineWorkflowScenarios(
       exclusions: [{ path: "vendor/removed.ts", reason: "project-ignored" }],
     },
   };
+  // Exclusion reasons that require a pattern are a nested union, merged in
+  // the full advertisement for clients that drop it; runtime still rejects.
   expect(
     ajv.validate(
       advertisedInputJsonSchema(toolContract("compare_source_to_bundle")),
       missingPattern,
     ),
-  ).toBe(false);
+  ).toBe(true);
   const rejectedExclusion = await harness.client.callTool({
     name: "compare_source_to_bundle",
     arguments: missingPattern,

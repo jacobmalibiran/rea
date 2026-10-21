@@ -38,6 +38,10 @@ const viewValidators = async (client: Client) => {
   return { validateInput, validateOutput };
 };
 
+/**
+ * Collection-specific fields are a nested union, merged in the full
+ * advertisement for clients that drop it; runtime validation still rejects.
+ */
 const assertInvalidNodeField = async (
   client: Client,
   evidenceId: string,
@@ -48,7 +52,7 @@ const assertInvalidNodeField = async (
     view: { kind: "inventory", collection: "nodes", fields: ["logical_path"] },
   };
   if (validateFullInput !== undefined)
-    expect(validateFullInput(arguments_)).toBe(false);
+    expect(validateFullInput(arguments_)).toBe(true);
   const rejected = await client.callTool({
     name: "inspect_analysis_view",
     arguments: arguments_,

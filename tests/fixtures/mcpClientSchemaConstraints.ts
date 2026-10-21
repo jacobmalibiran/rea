@@ -72,3 +72,71 @@ export const booleanLiteralSchemaError = (
   }
   return undefined;
 };
+
+/**
+ * Claude's MCP client fills every advertised property default the caller
+ * omitted, including inside nested objects, before the call reaches the
+ * server. Return the arguments such a client sends for `value`.
+ */
+export const withAdvertisedDefaults = (
+  schema: unknown,
+  value: unknown,
+): unknown => {
+  if (!isRecord(schema)) return value;
+  const members = Array.isArray(schema.allOf) ? schema.allOf : [];
+  const merged = members.reduce<unknown>(
+    (current, member) => withAdvertisedDefaults(member, current),
+    value,
+  );
+  if (Array.isArray(merged))
+    return isRecord(schema.items)
+      ? merged.map((item: unknown) =>
+          withAdvertisedDefaults(schema.items, item),
+        )
+      : merged;
+  const properties = schema.properties;
+  if (!isRecord(merged) || !isRecord(properties)) return merged;
+  const entries = Object.entries(merged).map(([name, child]) => [
+    name,
+    Object.hasOwn(properties, name)
+      ? withAdvertisedDefaults(properties[name], child)
+      : child,
+  ]);
+  for (const [name, child] of Object.entries(properties))
+    if (
+      !Object.hasOwn(merged, name) &&
+      isRecord(child) &&
+      child.default !== undefined
+    )
+      entries.push([
+        name,
+        withAdvertisedDefaults(child, structuredClone(child.default)),
+      ]);
+  return Object.fromEntries(entries);
+};
+
+/**
+ * Claude Code presents a nested anyOf or oneOf as an empty schema, or as an
+ * object without properties when every branch is an object, so callers lose
+ * every field the union describes.
+ */
+export const nestedUnionSchemaErrors = (
+  schema: unknown,
+  path: string,
+): readonly string[] => {
+  if (Array.isArray(schema))
+    return schema.flatMap((child: unknown, index) =>
+      nestedUnionSchemaErrors(child, `${path}[${index}]`),
+    );
+  if (!isRecord(schema)) return [];
+  return Object.entries(schema).flatMap(([key, value]) => {
+    if (key === "anyOf" || key === "oneOf") return [`${path}.${key}`];
+    if (schemaMaps.has(key) && isRecord(value))
+      return Object.entries(value).flatMap(([name, child]) =>
+        nestedUnionSchemaErrors(child, `${path}.${key}.${name}`),
+      );
+    if (schemaArrays.has(key) || schemaChildren.has(key))
+      return nestedUnionSchemaErrors(value, `${path}.${key}`);
+    return [];
+  });
+};

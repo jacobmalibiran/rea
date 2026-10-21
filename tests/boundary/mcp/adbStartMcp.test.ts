@@ -155,27 +155,24 @@ const assertAdvertisedActivityExtras = async (
       ],
     }),
   ).toBe(true);
+  // The advertisement merges per-type extras for clients that drop nested
+  // unions; runtime validation still rejects each mismatched value.
+  const callsBeforeInvalidExtra = await calls();
   for (const [type, value] of [
     ["boolean", ""],
     ["boolean", "yes"],
     ["int", "1.5"],
     ["long", ""],
     ["float", "1e3"],
-  ])
-    expect(
-      validateInput({ ...input, extras: [{ key: "invalid", type, value }] }),
-      `${type}: ${value}`,
-    ).toBe(false);
-
-  const callsBeforeInvalidExtra = await calls();
-  const invalidExtra = await client.callTool({
-    name: "start_adb_activity",
-    arguments: {
-      ...input,
-      extras: [{ key: "invalid", type: "boolean", value: "yes" }],
-    },
-  });
-  expect(invalidExtra.isError).toBe(true);
+  ]) {
+    const extras = [{ key: "invalid", type, value }];
+    expect(validateInput({ ...input, extras }), `${type}: ${value}`).toBe(true);
+    const invalidExtra = await client.callTool({
+      name: "start_adb_activity",
+      arguments: { ...input, extras },
+    });
+    expect(invalidExtra.isError, `${type}: ${value}`).toBe(true);
+  }
   expect(await calls()).toEqual(callsBeforeInvalidExtra);
 };
 

@@ -13,6 +13,8 @@ import { nativeMatchingInventory } from "../../fixtures/nativeFunctionMatching.j
 import {
   arrayItemSchemaError,
   booleanLiteralSchemaError,
+  nestedUnionSchemaErrors,
+  withAdvertisedDefaults,
 } from "../../fixtures/mcpClientSchemaConstraints.js";
 import { toolRegistrationOptions } from "../../../src/server/toolRegistrationOptions.js";
 
@@ -492,20 +494,19 @@ describe("MCP JSON Schema validity", () => {
             "items",
             "properties",
             "source",
-            "anyOf",
+            "properties",
           ],
-          expect.arrayContaining([
-            expect.objectContaining({
+          // Branches that strip unknown keys admit any value for fields
+          // other branches declare, so merged fields keep only their names.
+          expect.objectContaining({
+            included: { type: "boolean" },
+            reason: {},
+            artifact: expect.objectContaining({
               properties: expect.objectContaining({
-                reason: { type: "string" },
+                sha256: expect.anything(),
               }),
             }),
-            expect.objectContaining({
-              properties: expect.objectContaining({
-                artifact: expect.objectContaining({ type: "object" }),
-              }),
-            }),
-          ]),
+          }),
         );
       const catalogProjection = tools.map((tool) => ({
         name: tool.name,
@@ -545,6 +546,103 @@ describe("MCP JSON Schema validity", () => {
     }
   });
 });
+
+type AdvertisedInputs = ReadonlyMap<
+  string,
+  { readonly inputSchema: Record<string, unknown> }
+>;
+
+/** Claude's client fills advertised defaults; runtime must still accept them. */
+function expectClientDefaultsAccepted(advertised: AdvertisedInputs): void {
+  for (const contract of TOOL_CONTRACTS)
+    for (const example of contract.examples)
+      expect(
+        contract.inputSchema.safeParse(
+          withAdvertisedDefaults(
+            advertised.get(contract.name)?.inputSchema,
+            example.input,
+          ),
+        ).success,
+        `${contract.name}: ${example.title} with advertised defaults`,
+      ).toBe(true);
+  // A javascript-facts page once received other views' defaults.
+  const viewContract = TOOL_CONTRACTS.find(
+    ({ name }) => name === "inspect_analysis_view",
+  );
+  const factsPage = {
+    source: { kind: "retained-evidence", evidence_id: `ev_${"a".repeat(64)}` },
+    view: {
+      kind: "javascript-facts",
+      property_keys: [],
+      include_available_property_keys: true,
+      offset: 0,
+      limit: 64,
+    },
+  };
+  expect(viewContract?.inputSchema.safeParse(factsPage).success).toBe(true);
+  expect(
+    viewContract?.inputSchema.safeParse(
+      withAdvertisedDefaults(
+        advertised.get("inspect_analysis_view")?.inputSchema,
+        factsPage,
+      ),
+    ).success,
+  ).toBe(true);
+}
+
+/**
+ * Union-typed parameters keep their fields for clients that drop nested
+ * anyOf and oneOf. Group guidance names the values that select each group,
+ * because Claude hides const and the merged schema no longer pairs them.
+ */
+function expectMergedUnionGuidance(advertised: AdvertisedInputs): void {
+  expect(
+    advertised.get("trace_application_feature")?.inputSchema,
+  ).toMatchObject({
+    properties: {
+      seed: {
+        type: "object",
+        properties: {
+          kind: { enum: expect.arrayContaining(["string", "channel"]) },
+          value: { type: "string" },
+          match: { enum: ["exact", "contains", null] },
+        },
+        required: ["kind", "value"],
+      },
+      application: {
+        type: "object",
+        properties: {
+          kind: { const: "retained-evidence" },
+          evidence_id: { type: "string" },
+        },
+        required: ["evidence_id"],
+        description: expect.stringContaining(
+          '; kind:"retained-evidence" + evidence_id.',
+        ),
+      },
+    },
+  });
+  expect(
+    advertised.get("trace_javascript_semantics")?.inputSchema,
+  ).toHaveProperty(
+    ["properties", "query", "properties", "seed", "description"],
+    expect.stringContaining('kind:"function" + fingerprint_sha256'),
+  );
+  expect(advertised.get("inspect_analysis_view")?.inputSchema).toHaveProperty(
+    ["properties", "view", "description"],
+    expect.stringContaining(
+      'kind:"javascript-facts" + property_keys + [where]',
+    ),
+  );
+  expect(advertised.get("inspect_with_objdump")?.inputSchema).toHaveProperty(
+    ["properties", "operation", "enum"],
+    expect.arrayContaining(["disassemble", "architectures"]),
+  );
+  expect(advertised.get("open_binary")?.inputSchema).toHaveProperty(
+    ["properties", "provider_id", "description"],
+    expect.stringContaining('Accepted forms: "auto"'),
+  );
+}
 
 describe("MCP root input schemas", () => {
   it("advertises object roots while enforcing union requirements at runtime", async () => {
@@ -588,6 +686,10 @@ describe("MCP root input schemas", () => {
         // Anthropic tool input schemas reject root combinators.
         for (const combinator of ["anyOf", "oneOf", "allOf"])
           expect(inputSchema, contract.name).not.toHaveProperty(combinator);
+        expect(
+          nestedUnionSchemaErrors(inputSchema, contract.name),
+          contract.name,
+        ).toEqual([]);
         const validate = ajv.compile(inputSchema);
         for (const example of contract.examples)
           expect(
@@ -595,6 +697,8 @@ describe("MCP root input schemas", () => {
             `${contract.name}: ${example.title}`,
           ).toBe(true);
       }
+      expectClientDefaultsAccepted(advertised);
+      expectMergedUnionGuidance(advertised);
 
       expectStrictInputSchemaParity(tools, ajv);
 
@@ -712,9 +816,9 @@ const advertiseAndEnforceItemSelectorCollectionConstraints =
         view: { kind: "item", collection, selector },
       });
       const nodeId = `jag_node_${"b".repeat(64)}`;
-      // Collection-specific selector constraints must survive JSON Schema
-      // conversion: the advertised schema rejects exactly what runtime
-      // input validation rejects.
+      // Clients that drop nested unions cannot see collection-specific
+      // selectors, so the advertisement merges them. Runtime input
+      // validation still rejects every mismatched collection and selector.
       const invalid: ReadonlyArray<readonly [string, unknown]> = [
         ["modules", { index: 0 }],
         ["modules", { name: "entry" }],
@@ -735,10 +839,12 @@ const advertiseAndEnforceItemSelectorCollectionConstraints =
         expect(contract.inputSchema.safeParse(input).success, label).toBe(
           false,
         );
-        expect(validate(input), `advertised schema rejects ${label}`).toBe(
-          false,
+        expect(validate(input), `advertised schema accepts ${label}`).toBe(
+          true,
         );
       }
+      expect(validate(itemInput("modules", {}))).toBe(false);
+      expect(validate(itemInput("unknown", { index: 0 }))).toBe(false);
       for (const [collection, selector] of valid) {
         const input = itemInput(collection, selector);
         const label = `${collection}/${Object.keys(selector as object)[0]}`;
@@ -753,7 +859,7 @@ const advertiseAndEnforceItemSelectorCollectionConstraints =
   };
 
 it(
-  "advertises and enforces the item selector collection constraints",
+  "advertises merged item selectors while runtime enforces collection constraints",
   advertiseAndEnforceItemSelectorCollectionConstraints,
 );
 
