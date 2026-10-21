@@ -1,10 +1,10 @@
 import { z } from "zod";
+import { borrowedInputSchema } from "../../domain/borrowedInputSchema.js";
 import { evidenceInputSchema } from "../../domain/evidenceReference.js";
 
 // Borrow inline payloads until application admission; advertise the exact public
 // Evidence/reference union without a pre-admission recursive SDK clone.
-const input = z.unknown().nonoptional();
-input._zod.processJSONSchema = evidenceInputSchema._zod.processJSONSchema;
+const input = borrowedInputSchema(evidenceInputSchema);
 // Borrow the outer selections too: admission must account for their width before
 // any array traversal/copy. The owner authenticates each selected carrier later.
 const observations = z.custom<unknown[]>(Array.isArray);

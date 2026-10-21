@@ -9,6 +9,7 @@ import { TOOL_CONTRACTS } from "../../../src/contracts/toolContracts.js";
 import { emptyArraySchema } from "../../../src/domain/emptyArraySchema.js";
 import { processScenarioSchema } from "../../../src/domain/process/processScenario.js";
 import { GENERATED_MCP_TOOL_CATALOG } from "../../fixtures/mcpToolCatalog.js";
+import { nativeMatchingInventory } from "../../fixtures/nativeFunctionMatching.js";
 import {
   arrayItemSchemaError,
   booleanLiteralSchemaError,
@@ -755,6 +756,64 @@ it(
   "advertises and enforces the item selector collection constraints",
   advertiseAndEnforceItemSelectorCollectionConstraints,
 );
+
+it("advertises described native matching inventories as Evidence or retained references", async () => {
+  const contract = TOOL_CONTRACTS.find(
+    ({ name }) => name === "match_native_functions",
+  );
+  if (contract === undefined)
+    throw new Error("match_native_functions contract was not registered");
+
+  const server = new McpServer({
+    name: "native-matching-schema",
+    version: "0",
+  });
+  server.registerTool(
+    contract.name,
+    toolRegistrationOptions(contract),
+    async () => ({ content: [] }),
+  );
+  const client = new Client({ name: "native-matching-schema", version: "0" });
+  const [clientTransport, serverTransport] =
+    InMemoryTransport.createLinkedPair();
+  try {
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    const advertised = (await client.listTools()).tools.find(
+      ({ name }) => name === contract.name,
+    );
+    if (advertised === undefined)
+      throw new Error("match_native_functions tool was not advertised");
+
+    // Runtime parsing borrows these values until admission, so only the
+    // advertised schema can show callers the Evidence/reference shape.
+    const validate = new Ajv2020({
+      strict: false,
+      validateFormats: false,
+    }).compile(advertised.inputSchema);
+    const reference = {
+      kind: "retained-evidence",
+      evidence_id: `ev_${"a".repeat(64)}`,
+    };
+    const inventory = nativeMatchingInventory("1", [
+      { address: "0x10", value: "main" },
+    ]);
+    expect(validate({ left: inventory, right: reference })).toBe(true);
+    expect(validate({ left: reference, right: inventory })).toBe(true);
+    for (const side of ["left", "right"])
+      for (const malformed of [
+        7,
+        { kind: "retained-evidence" },
+        { evidence_id: reference.evidence_id },
+      ])
+        expect(
+          validate({ left: reference, right: reference, [side]: malformed }),
+          `${side}: ${JSON.stringify(malformed)}`,
+        ).toBe(false);
+  } finally {
+    await Promise.allSettled([client.close(), server.close()]);
+  }
+});
 
 describe("MCP process input JSON Schema", () => {
   it("advertises process strings without weakening terminal input", async () => {
