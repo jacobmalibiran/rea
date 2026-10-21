@@ -96,6 +96,7 @@ import {
 } from "../native/nativeInventory.js";
 
 import { absoluteLocalPathStringSchema } from "../localPath.js";
+import { borrowedInputSchema } from "../borrowedInputSchema.js";
 import { z } from "zod";
 import {
   desktopViewRequestSchema,
@@ -364,9 +365,7 @@ export const analysisViewRequestSchema = z.discriminatedUnion("kind", [
 // The application owns admission and authenticated Evidence parsing. SDK and
 // CLI envelope parsing must borrow this unknown value rather than clone it
 // before admission. Advertise the owning Evidence contract in both dialects.
-const inlineEvidenceInputSchema = z.unknown().nonoptional();
-inlineEvidenceInputSchema._zod.processJSONSchema =
-  evidenceSchema._zod.processJSONSchema;
+const inlineEvidenceInputSchema = borrowedInputSchema(evidenceSchema);
 
 /** Unauthenticated inline input, an exact same-session retained reference, or one local Evidence file. */
 export const analysisViewSourceSchema = z.discriminatedUnion("kind", [
