@@ -10,6 +10,7 @@ import {
   transformAdvertisedInputJsonSchema,
 } from "./toolSchemaMetadata.js";
 import { JAVASCRIPT_APPLICATION_EVIDENCE_EXAMPLE } from "./javascript/javascriptRuntimeReconciliationExample.js";
+import { withAdvertisedDefaults } from "../../tests/fixtures/mcpClientSchemaConstraints.js";
 
 it.each(["draft-2020-12", "draft-07"] as const)(
   "honors projection options independently of cached wire transformations in %s",
@@ -490,7 +491,7 @@ describe("advertised Boolean literals", () => {
 });
 
 describe("advertised Boolean schema composition", () => {
-  it("widens an affected oneOf to anyOf when branches could overlap", () => {
+  it("widens an affected oneOf to every value either branch accepts", () => {
     const canonical = {
       type: "object",
       properties: {
@@ -507,10 +508,10 @@ describe("advertised Boolean schema composition", () => {
     expect(canonicalValidate({ flag: true })).toBe(true);
     expect(canonicalValidate({ flag: false })).toBe(false);
     expect(advertisedValidate({ flag: true })).toBe(true);
-    expect(advertised).toHaveProperty(["properties", "flag", "anyOf"]);
+    expect(advertised).toHaveProperty(["properties", "flag"], {});
   });
 
-  it("retains nested branch guidance when widening oneOf to anyOf", () => {
+  it("retains nested branch guidance when merging a widened oneOf", () => {
     const canonical = {
       type: "object",
       properties: {
@@ -546,15 +547,22 @@ describe("advertised Boolean schema composition", () => {
     const example = { selection: { source: "capture.json", mode: false } };
     expect(canonicalValidate(example)).toBe(true);
     expect(advertisedValidate(example)).toBe(true);
-    expect(advertised).toMatchObject({
+    expect(
+      advertisedValidate({ selection: { target: "out.json", mode: true } }),
+    ).toBe(true);
+    expect(advertisedValidate({ selection: { other: true } })).toBe(false);
+    expect(advertised).toHaveProperty(["properties", "selection"], {
+      type: "object",
       properties: {
-        selection: {
-          anyOf: [
-            { properties: { source: { type: "string" } } },
-            { properties: { target: { type: "string" } } },
-          ],
-        },
+        source: { type: "string" },
+        mode: { type: "boolean" },
+        target: { type: "string" },
       },
+      required: ["mode"],
+      minProperties: 2,
+      additionalProperties: false,
+      description:
+        "Provide a complete input group: source + mode:false; target + mode:true.",
     });
   });
 
@@ -737,3 +745,266 @@ it.each(["$ref", "$dynamicRef"])(
       expect(advertised(value)).toBe(canonical(value));
   },
 );
+
+const unionKeywordPaths = (schema: unknown, path = "$"): string[] => {
+  if (Array.isArray(schema))
+    return schema.flatMap((child: unknown, index) =>
+      unionKeywordPaths(child, `${path}[${index}]`),
+    );
+  if (typeof schema !== "object" || schema === null) return [];
+  return Object.entries(schema).flatMap(([key, value]) =>
+    key === "anyOf" || key === "oneOf"
+      ? [`${path}.${key}`]
+      : ["const", "enum", "default", "examples"].includes(key)
+        ? []
+        : unionKeywordPaths(value, `${path}.${key}`),
+  );
+};
+
+describe("advertised nested alternatives", () => {
+  it("merges literal alternatives and null into one enum", () => {
+    const advertised = presentInputJsonSchema(
+      {
+        type: "object",
+        properties: {
+          match: {
+            anyOf: [
+              { type: "string", enum: ["exact", "contains"] },
+              { type: "null" },
+            ],
+          },
+        },
+      },
+      () => undefined,
+    );
+    expect(advertised.properties).toEqual({
+      match: { type: ["string", "null"], enum: ["exact", "contains", null] },
+    });
+  });
+
+  it("describes literal and pattern forms that one type cannot express", () => {
+    const canonical = {
+      type: "object",
+      properties: {
+        provider_id: {
+          description: "Provider selection.",
+          anyOf: [
+            { type: "string", const: "auto" },
+            { type: "string", minLength: 1, pattern: "^[a-z][a-z0-9-]*$" },
+          ],
+        },
+      },
+    };
+    const advertised = presentInputJsonSchema(canonical, () => undefined);
+    expect(advertised.properties).toEqual({
+      provider_id: {
+        type: "string",
+        description:
+          'Provider selection. Accepted forms: "auto"; string matching ^[a-z][a-z0-9-]*$.',
+      },
+    });
+    const validate = new Ajv2020({ strict: false }).compile(advertised);
+    for (const provider_id of ["auto", "ghidra"])
+      expect(validate({ provider_id })).toBe(true);
+    expect(validate({ provider_id: 7 })).toBe(false);
+  });
+
+  it.each(["draft-2020-12", "draft-07"] as const)(
+    "accepts every canonical input without nested unions in %s",
+    (target) => {
+      const canonical = z.strictObject({
+        seed: z.union([
+          z.union([
+            z.strictObject({
+              kind: z.enum(["route", "string"]),
+              value: z.string().min(1),
+              match: z.enum(["exact", "contains"]).nullable().default(null),
+            }),
+            z.strictObject({
+              kind: z.literal("module"),
+              value: z.literal(""),
+              match: z.literal("exact"),
+            }),
+          ]),
+          z.strictObject({
+            kind: z.literal("api"),
+            entry_path: z.array(z.string()).min(1),
+          }),
+        ]),
+        range: z.tuple([z.number(), z.number()]).or(z.literal("all")),
+        target: z
+          .string()
+          .regex(/^ev_[a-f0-9]{4}$/u)
+          .or(z.null()),
+      });
+      const projected = z.toJSONSchema(canonical, { io: "input", target });
+      const advertised = presentInputJsonSchema(projected, () => undefined);
+      expect(unionKeywordPaths(advertised)).toEqual([]);
+      const ajv =
+        target === "draft-2020-12"
+          ? new Ajv2020({ strict: false })
+          : new Ajv({ strict: false });
+      expect(ajv.validateSchema(advertised)).toBe(true);
+      const validate = ajv.compile(advertised);
+      const seeds = [
+        { kind: "route", value: "/notes" },
+        { kind: "string", value: "Export notes", match: "contains" },
+        { kind: "module", value: "", match: "exact" },
+        { kind: "api", entry_path: ["notes", "exportCsv"] },
+      ];
+      for (const seed of seeds)
+        for (const range of [[0, 4], "all"])
+          for (const target of ["ev_00af", null]) {
+            const input = { seed, range, target };
+            expect(canonical.safeParse(input).success).toBe(true);
+            expect(validate(input), JSON.stringify(input)).toBe(true);
+          }
+      expect(validate({ seed: {}, range: "all", target: null })).toBe(false);
+      expect(
+        validate({ seed: seeds[0], range: "all", target: null, other: 1 }),
+      ).toBe(false);
+      expect(advertised).toMatchObject({
+        properties: {
+          seed: {
+            type: "object",
+            properties: {
+              kind: { enum: ["route", "string", "module", "api"] },
+              entry_path: { type: "array" },
+            },
+            required: ["kind"],
+            additionalProperties: false,
+          },
+          range: { type: ["array", "string"] },
+        },
+      });
+    },
+  );
+});
+
+describe("advertised merged alternatives", () => {
+  it("advertises only defaults that every alternative applies", () => {
+    const canonical = z.strictObject({
+      view: z.union([
+        z.strictObject({
+          kind: z.literal("facts"),
+          offset: z.number().default(0),
+          limit: z.number().default(64),
+        }),
+        z.strictObject({
+          kind: z.literal("capture"),
+          detail: z.enum(["preview", "complete"]).default("preview"),
+          limit: z.number().default(64),
+        }),
+        z.strictObject({
+          kind: z.literal("summary"),
+          limit: z.number().default(64),
+        }),
+      ]),
+    });
+    const advertised = presentInputJsonSchema(
+      z.toJSONSchema(canonical, { io: "input" }),
+      () => undefined,
+    );
+    const field = (name: string) => ["properties", "view", "properties", name];
+    expect(advertised).toHaveProperty([...field("limit"), "default"], 64);
+    expect(advertised).toHaveProperty(field("offset"));
+    expect(advertised).not.toHaveProperty([...field("offset"), "default"]);
+    expect(advertised).not.toHaveProperty([...field("detail"), "default"]);
+    // Claude's client sends every advertised default the caller omitted.
+    for (const kind of ["facts", "capture", "summary"]) {
+      const sent = withAdvertisedDefaults(advertised, { view: { kind } });
+      expect(sent).toEqual({ view: { kind, limit: 64 } });
+      expect(canonical.safeParse(sent).success, kind).toBe(true);
+    }
+  });
+
+  it("labels input groups with the canonical values that select them", () => {
+    const canonical = z.strictObject({
+      seed: z.union([
+        z.strictObject({
+          kind: z.literal("semantic-node"),
+          node_id: z.string(),
+        }),
+        z.strictObject({
+          kind: z.literal("application-node"),
+          node_id: z.string(),
+        }),
+        z.strictObject({ kind: z.literal("literal"), value: z.string() }),
+        z.strictObject({
+          kind: z.literal("function"),
+          fingerprint: z.string(),
+        }),
+      ]),
+      selection: z.union([
+        z.strictObject({ included: z.literal(true), artifact: z.string() }),
+        z.strictObject({ included: z.literal(false), reason: z.string() }),
+      ]),
+      reference: z.union([
+        z.strictObject({
+          evidence_id: z.string(),
+          confidence: z.enum(["observed", "derived"]),
+        }),
+        z.strictObject({
+          kind: z.literal("retained-evidence"),
+          evidence_id: z.string(),
+        }),
+      ]),
+    });
+    const advertised = presentInputJsonSchema(
+      z.toJSONSchema(canonical, { io: "input" }),
+      () => undefined,
+    );
+    // Groups differing in one field join exactly; Boolean literals that the
+    // advertisement widens stay named, and fully enumerated fields stay bare.
+    expect(advertised).toHaveProperty(
+      ["properties", "seed", "description"],
+      'Provide a complete input group: kind:"semantic-node"|"application-node" + node_id; kind:"literal" + value; kind:"function" + fingerprint.',
+    );
+    expect(advertised).toHaveProperty(
+      ["properties", "selection", "properties", "included"],
+      { type: "boolean" },
+    );
+    expect(advertised).toHaveProperty(
+      ["properties", "selection", "description"],
+      "Provide a complete input group: included:true + artifact; included:false + reason.",
+    );
+    expect(advertised).toHaveProperty(
+      ["properties", "reference", "description"],
+      'Provide a complete input group: evidence_id + confidence; kind:"retained-evidence" + evidence_id.',
+    );
+  });
+
+  it("keeps alternatives whose reference targets cannot be merged", () => {
+    const branch = { $ref: "#/$defs/name" };
+    const presented = presentInputJsonSchema(
+      {
+        $defs: { name: { type: "string" } },
+        type: "object",
+        properties: { name: { anyOf: [branch, { type: "null" }] } },
+      },
+      () => undefined,
+    );
+    expect(presented).toHaveProperty(
+      ["properties", "name", "anyOf"],
+      [branch, { type: "null" }],
+    );
+  });
+});
+
+it("keeps a nested union whose branch a reference targets", () => {
+  const source = {
+    type: "object",
+    properties: {
+      value: { anyOf: [{ type: "string" }, { type: "number" }] },
+      alias: { $ref: "#/properties/value/anyOf/1" },
+    },
+  };
+  const presented = presentInputJsonSchema(source, () => undefined);
+  expect(presented).toMatchObject({
+    properties: { value: { anyOf: expect.any(Array) } },
+  });
+  const canonical = new Ajv2020({ strict: false }).compile(source);
+  const advertised = new Ajv2020({ strict: false }).compile(presented);
+  for (const alias of [7, "seven", null])
+    expect(advertised({ alias })).toBe(canonical({ alias }));
+});

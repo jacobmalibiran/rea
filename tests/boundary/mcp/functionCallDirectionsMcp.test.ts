@@ -88,13 +88,16 @@ it.each(profiles)("preserves directional gaps (%s)", async (profile) => {
         goal: { address: "0x9999" },
       };
       expect(validate(input), JSON.stringify(validate.errors)).toBe(true);
-      for (const limited_directions of [
-        [],
-        ["callers", "callers"],
-        ["callees", "callees"],
-        ["callers", "callees", "callers"],
-        ["incoming"],
-      ]) {
+      // Direction tuples are a nested union. The advertisement keeps the
+      // direction values and length bounds for clients that drop it, while
+      // runtime validation still owns uniqueness.
+      for (const [limited_directions, advertised] of [
+        [[], false],
+        [["callers", "callers"], true],
+        [["callees", "callees"], true],
+        [["callers", "callees", "callers"], false],
+        [["incoming"], false],
+      ] as const) {
         const malformed = {
           ...input,
           functions: [
@@ -107,7 +110,10 @@ it.each(profiles)("preserves directional gaps (%s)", async (profile) => {
             },
           ],
         };
-        if (profile === "full") expect(validate(malformed)).toBe(false);
+        if (profile === "full")
+          expect(validate(malformed), JSON.stringify(limited_directions)).toBe(
+            advertised,
+          );
         const rejected = await client.callTool({
           name: "build_call_path",
           arguments: malformed,

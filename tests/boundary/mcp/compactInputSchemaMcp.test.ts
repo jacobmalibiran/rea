@@ -28,6 +28,7 @@ import { toolRegistrationOptions } from "../../../src/server/toolRegistrationOpt
 import {
   arrayItemSchemaError,
   booleanLiteralSchemaError,
+  nestedUnionSchemaErrors,
 } from "../../fixtures/mcpClientSchemaConstraints.js";
 
 interface AdvertisedTool {
@@ -286,6 +287,10 @@ it("keeps SDK-converted schemas valid and accepting canonical examples", async (
       expect(
         booleanLiteralSchemaError(tool.inputSchema, tool.name),
       ).toBeUndefined();
+      expect(
+        nestedUnionSchemaErrors(tool.inputSchema, tool.name),
+        `${profile} profile`,
+      ).toEqual([]);
       expect(
         ajv.validateSchema(tool.inputSchema),
         `${profile} profile, ${tool.name}: ${ajv.errorsText(ajv.errors)}`,

@@ -2,6 +2,13 @@ import {
   JsonSchemaReferences,
   type JsonSchemaScope,
 } from "./jsonSchemaReferences.js";
+import {
+  attachAlternatives,
+  mergeAlternatives,
+  sharedFieldDefault,
+  unionBranches,
+  withDefault,
+} from "./inputSchemaAlternatives.js";
 import { isDeepStrictEqual } from "node:util";
 
 import {
@@ -155,63 +162,89 @@ type SchemaNormalization = {
   readonly changed: boolean;
 };
 
-const isBooleanLiteralSchema = (schema: unknown): boolean =>
-  isObject(schema) &&
-  (typeof schema.const === "boolean" ||
-    (Array.isArray(schema.enum) &&
-      schema.enum.length > 0 &&
-      schema.enum.every((value) => typeof value === "boolean")));
+/** Union locations whose branches a merge must keep, or every union. */
+type MergeBlocks = ReadonlySet<string> | "all";
 
-const isBooleanSchema = (schema: unknown): boolean =>
-  isObject(schema) &&
-  (schema.type === "boolean" || isBooleanLiteralSchema(schema));
+const schemaPointer = (path: readonly string[]): string =>
+  path
+    .map((token) => token.replaceAll("~", "~0").replaceAll("/", "~1"))
+    .join("/");
 
-const preserveSharedDefault = (
-  schema: Record<string, unknown>,
-  branches: readonly unknown[],
-): void => {
-  if (schema.default !== undefined) return;
-  const defaults = branches
-    .filter(isObject)
-    .map((branch) => branch.default)
-    .filter((value) => value !== undefined);
-  if (
-    defaults.length > 0 &&
-    defaults.every((value) => isDeepStrictEqual(value, defaults[0]))
-  )
-    schema.default = defaults[0];
+/**
+ * Merging a union removes its branch locations. Keep every union that a
+ * reference targets through `anyOf`/`oneOf`, and every union when the
+ * reference owner cannot place a reference in this document.
+ */
+const unionsReferencedBy = (references: JsonSchemaReferences): MergeBlocks => {
+  const blocked = new Set<string>();
+  for (const { scope, target } of references.references()) {
+    if (target.kind !== "target" || scope !== references.rootScope)
+      return "all";
+    target.path.forEach((token, index) => {
+      if (token === "anyOf" || token === "oneOf")
+        blocked.add(schemaPointer(target.path.slice(0, index)));
+    });
+  }
+  return blocked;
 };
 
-const normalizeAdvertisedSchema = (value: unknown): SchemaNormalization => {
+const resourceIdentityKeywords = [
+  "$id",
+  "$anchor",
+  "$dynamicAnchor",
+  "$recursiveAnchor",
+  "$dynamicRef",
+  "$recursiveRef",
+];
+const literalKeywords = new Set(["const", "enum", "default", "examples"]);
+
+/** Branch-owned resources or anchors would change scope when lifted. */
+const declaresResourceIdentity = (schema: unknown): boolean =>
+  Array.isArray(schema)
+    ? schema.some(declaresResourceIdentity)
+    : isObject(schema) &&
+      (resourceIdentityKeywords.some((key) => Object.hasOwn(schema, key)) ||
+        Object.entries(schema).some(
+          ([key, child]) =>
+            !literalKeywords.has(key) && declaresResourceIdentity(child),
+        ));
+
+const normalizeAdvertisedSchema = (
+  value: unknown,
+  path: readonly string[],
+  blocked: MergeBlocks,
+): SchemaNormalization => {
   if (!isObject(value)) return { schema: value, changed: false };
 
   const node: Record<string, unknown> = { ...value };
   let changed = false;
-  const normalizeMap = (map: Readonly<Record<string, unknown>>) =>
+  const normalizeChild = (child: unknown, ...tokens: string[]) =>
+    normalizeAdvertisedSchema(child, [...path, ...tokens], blocked);
+  const normalizeMap = (key: string, map: Readonly<Record<string, unknown>>) =>
     Object.fromEntries(
       Object.entries(map).map(([name, child]) => {
-        const result = normalizeAdvertisedSchema(child);
+        const result = normalizeChild(child, key, name);
         changed ||= result.changed;
         return [name, result.schema];
       }),
     );
-  const normalizeList = (list: readonly unknown[]) =>
-    list.map((child) => {
-      const result = normalizeAdvertisedSchema(child);
+  const normalizeList = (key: string, list: readonly unknown[]) =>
+    list.map((child, index) => {
+      const result = normalizeChild(child, key, String(index));
       changed ||= result.changed;
       return result;
     });
 
   for (const [key, child] of Object.entries(value)) {
     if (schemaMaps.has(key) && isObject(child)) {
-      node[key] = normalizeMap(child);
+      node[key] = normalizeMap(key, child);
     } else if (
       schemaArrays.has(key) &&
       key !== "anyOf" &&
       key !== "oneOf" &&
       Array.isArray(child)
     ) {
-      node[key] = normalizeList(child).map((result) => result.schema);
+      node[key] = normalizeList(key, child).map((result) => result.schema);
     } else if (
       schemaChildren.has(key) &&
       key !== "not" &&
@@ -220,8 +253,8 @@ const normalizeAdvertisedSchema = (value: unknown): SchemaNormalization => {
       key !== "else"
     ) {
       const results = Array.isArray(child)
-        ? normalizeList(child)
-        : [normalizeAdvertisedSchema(child)];
+        ? normalizeList(key, child)
+        : [normalizeChild(child, key)];
       const nestedChanged = results.some((result) => result.changed);
       if (
         key === "contains" &&
@@ -257,7 +290,7 @@ const normalizeAdvertisedSchema = (value: unknown): SchemaNormalization => {
   }
 
   const negated = Object.hasOwn(value, "not")
-    ? normalizeAdvertisedSchema(value.not)
+    ? normalizeChild(value.not, "not")
     : undefined;
   if (negated?.changed) {
     // Widening a predicate under `not` narrows the containing schema.
@@ -268,13 +301,13 @@ const normalizeAdvertisedSchema = (value: unknown): SchemaNormalization => {
   }
 
   const conditional = Object.hasOwn(value, "if")
-    ? normalizeAdvertisedSchema(value.if)
+    ? normalizeChild(value.if, "if")
     : undefined;
   const thenBranch = Object.hasOwn(value, "then")
-    ? normalizeAdvertisedSchema(value.then)
+    ? normalizeChild(value.then, "then")
     : undefined;
   const elseBranch = Object.hasOwn(value, "else")
-    ? normalizeAdvertisedSchema(value.else)
+    ? normalizeChild(value.else, "else")
     : undefined;
   if (conditional?.changed) {
     // Changing the predicate can route canonical-valid inputs into a rejecting branch.
@@ -297,18 +330,33 @@ const normalizeAdvertisedSchema = (value: unknown): SchemaNormalization => {
   for (const combinator of ["anyOf", "oneOf"] as const) {
     const branches = value[combinator];
     if (!Array.isArray(branches)) continue;
-    const normalized = normalizeList(branches);
+    // The root's union is presented by flattenRootObjectUnion, which owns
+    // the reference checks for lifting it.
+    const mergeable =
+      path.length > 0 &&
+      blocked !== "all" &&
+      !blocked.has(schemaPointer(path)) &&
+      !declaresResourceIdentity(branches);
+    const alternatives = mergeable ? unionBranches(branches) : [];
+    const merged = mergeable
+      ? mergeAlternatives(
+          normalizeList(combinator, alternatives).map(
+            (result) => result.schema,
+          ),
+          alternatives,
+        )
+      : undefined;
+    if (merged !== undefined) {
+      // A merged union accepts every input its branches accept.
+      delete node[combinator];
+      attachAlternatives(node, merged);
+      changed = true;
+      continue;
+    }
+    const normalized = normalizeList(combinator, branches);
     const schemas = normalized.map((result) => result.schema);
     const branchesChanged = normalized.some((result) => result.changed);
     if (combinator === "oneOf" && branchesChanged) {
-      const booleanLiteralsOnly = branches.every(isBooleanLiteralSchema);
-      if (booleanLiteralsOnly) {
-        node.type = "boolean";
-        preserveSharedDefault(node, schemas);
-        delete node.oneOf;
-        changed = true;
-        continue;
-      }
       // `anyOf` retains branch guidance without allowing widened branches to
       // reject inputs that were accepted by exactly one canonical branch.
       delete node.oneOf;
@@ -318,17 +366,6 @@ const normalizeAdvertisedSchema = (value: unknown): SchemaNormalization => {
       } else {
         node.anyOf = schemas;
       }
-      changed = true;
-      continue;
-    }
-    if (
-      branchesChanged &&
-      schemas.length > 0 &&
-      schemas.every(isBooleanSchema)
-    ) {
-      node.type = "boolean";
-      preserveSharedDefault(node, schemas);
-      delete node[combinator];
       changed = true;
       continue;
     }
@@ -402,11 +439,21 @@ const flattenRootObjectUnion = (
     ...presentation,
     type: "object",
     ...(description.length > 0 ? { description: description.join(" ") } : {}),
+    // Clients fill advertised defaults into omitted fields, so a lifted field
+    // keeps a default only when every group declares that same default.
     properties: Object.fromEntries(
-      [...variants].map(([name, schemas]) => [
-        name,
-        schemas.length === 1 ? schemas[0] : { anyOf: schemas },
-      ]),
+      [...variants].map(([name, schemas]) => {
+        const shared = sharedFieldDefault(branches, name);
+        return [
+          name,
+          schemas.length === 1
+            ? withDefault(schemas[0], shared)
+            : {
+                anyOf: schemas.map((schema) => withDefault(schema, undefined)),
+                ...(shared === undefined ? {} : { default: shared }),
+              },
+        ];
+      }),
     ),
     ...(required.length > 0 ? { required } : {}),
     ...(fewestRequired > 0 ? { minProperties: fewestRequired } : {}),
@@ -526,6 +573,7 @@ export const presentInputJsonSchema = (
 ): Record<string, unknown> => {
   const flattened = presentDiscriminatedRoot(root);
   const references = new JsonSchemaReferences(flattened);
+  const blocked = unionsReferencedBy(references);
   const described = describeSchema(
     flattened,
     references,
@@ -533,7 +581,7 @@ export const presentInputJsonSchema = (
     describeProperty,
   );
   if (!isObject(described))
-    return normalizeAdvertisedSchema(flattened).schema as Record<
+    return normalizeAdvertisedSchema(flattened, [], blocked).schema as Record<
       string,
       unknown
     >;
@@ -559,18 +607,17 @@ export const presentInputJsonSchema = (
             : [],
         );
   if (dependencyGuidance.length === 0)
-    return normalizeAdvertisedSchema(presentation).schema as Record<
-      string,
-      unknown
-    >;
+    return normalizeAdvertisedSchema(presentation, [], blocked)
+      .schema as Record<string, unknown>;
   const description = [
     typeof presentation.description === "string"
       ? presentation.description
       : undefined,
     ...dependencyGuidance,
   ].filter((text) => text !== undefined);
-  return normalizeAdvertisedSchema({
-    ...presentation,
-    description: description.join(" "),
-  }).schema as Record<string, unknown>;
+  return normalizeAdvertisedSchema(
+    { ...presentation, description: description.join(" ") },
+    [],
+    blocked,
+  ).schema as Record<string, unknown>;
 };

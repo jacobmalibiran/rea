@@ -203,11 +203,13 @@ const createInventoryViewReader = async (
   const outputSchema: Record<string, unknown> = advertised.outputSchema;
   const validateInput = ajv.compile(inputSchema);
   const validateOutput = ajv.compile(outputSchema);
+  // View selectors are a nested union, merged in the full advertisement for
+  // clients that drop it; runtime validation still rejects the empty set.
   const malformed = {
     source: { kind: "retained-evidence", evidence_id: parent.evidence_id },
     view: { kind: "inventory", collection: "nodes", logical_paths: [] },
   };
-  if (profile === "full") expect(validateInput(malformed)).toBe(false);
+  expect(validateInput(malformed)).toBe(true);
   const rejected = await client.callTool({
     name: "inspect_analysis_view",
     arguments: malformed,
