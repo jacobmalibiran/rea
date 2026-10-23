@@ -240,11 +240,12 @@ const parentFields = (
       parent.evidenceId,
       "limitations",
     ),
+    // Limitations are already listed once above; unknowns name only what the
+    // structured coverage leaves unresolved, as other views do.
     unknowns: boundedViewMessages(
-      limitations,
+      javascriptCoverageUnknowns(sourceCoverage),
       parent.evidenceId,
       "unknowns",
-      javascriptCoverageUnknowns(sourceCoverage),
     ),
   };
 };
