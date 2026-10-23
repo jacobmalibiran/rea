@@ -134,6 +134,17 @@ export const projectDesktopApplication = (
       "Analyze the candidate application archive with the static JavaScript workflow.",
     );
   }
+  for (const file of files.filter((file) => has(file, "go-build-info-section")))
+    probe(
+      "inspect_go_binary",
+      file,
+      "Read the declared Go build information; obfuscated builds may omit version and module records.",
+    );
+  candidate(
+    "pyinstaller",
+    files.filter((file) => has(file, "pyinstaller-archive-cookie")),
+    "A PyInstaller CArchive cookie declares an appended Python archive; its members and runtime behavior are unexamined.",
+  );
   const componentMarkers = [
     {
       expression: /(?:^|\/)bepinex(?:\/|$)/iu,

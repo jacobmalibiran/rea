@@ -1,4 +1,5 @@
 import {
+  chmod,
   mkdir,
   writeFile,
   symlink,
@@ -51,6 +52,11 @@ const put = async (root: string, path: string, bytes: Buffer | string) => {
   const destination = join(root, path);
   await mkdir(join(destination, ".."), { recursive: true });
   await writeFile(destination, bytes);
+};
+/** An extensionless file the scanner selects by its executable mode bit. */
+const putExecutable = async (root: string, path: string, bytes: Buffer) => {
+  await put(root, path, bytes);
+  await chmod(join(root, path), 0o755);
 };
 
 it("joins real PE/CLI reference facts and independent engine markers without picking a winner", async () => {
@@ -177,6 +183,174 @@ it("reads sparse embedded PCK ranges without hashing or retaining a large execut
   expect(report.files[0]?.facts).toContainEqual(
     expect.objectContaining({ kind: "godot-pck-header", offset: size - 32 }),
   );
+});
+
+/** `LC_SEGMENT_64` with one section, named as the Mach-O format declares it. */
+const segmentWithSection = (segment: string, section: string): Buffer => {
+  const bytes = Buffer.alloc(72 + 80);
+  bytes.writeUInt32LE(0x19, 0);
+  bytes.writeUInt32LE(bytes.length, 4);
+  bytes.write(segment, 8, "latin1");
+  bytes.writeUInt32LE(1, 64);
+  bytes.write(section, 72, "latin1");
+  bytes.write(segment, 72 + 16, "latin1");
+  return bytes;
+};
+const codeSignatureAt = (offset: number): Buffer => {
+  const bytes = Buffer.alloc(16);
+  bytes.writeUInt32LE(0x1d, 0);
+  bytes.writeUInt32LE(16, 4);
+  bytes.writeUInt32LE(offset, 8);
+  return bytes;
+};
+/** Little-endian ELF64 executable header with a declared entry point. */
+const elfExecutable = (): Buffer => {
+  const elf = Buffer.alloc(64);
+  elf.set([0x7f, 0x45, 0x4c, 0x46, 2, 1]);
+  elf.writeUInt16LE(2, 16);
+  elf.writeBigUInt64LE(0x1000n, 24);
+  return elf;
+};
+/** PyInstaller 2.1+ CArchive cookie for an archive of `archiveBytes` ending here. */
+const pyInstallerCookie = (archiveBytes: number, version = 314): Buffer => {
+  const cookie = Buffer.alloc(88);
+  const tocBytes = archiveBytes >= 88 + 16 ? 16 : 0;
+  Buffer.from([0x4d, 0x45, 0x49, 0x0c, 0x0b, 0x0a, 0x0b, 0x0e]).copy(cookie);
+  cookie.writeUInt32BE(archiveBytes, 8);
+  cookie.writeUInt32BE(Math.max(0, archiveBytes - 88 - tocBytes), 12);
+  cookie.writeUInt32BE(tocBytes, 16);
+  cookie.writeUInt32BE(version, 20);
+  cookie.write("Python", 24, "latin1");
+  return cookie;
+};
+
+it("offers Go and PyInstaller follow-ups only from format-declared executable markers", async () => {
+  const root = await createTestTempDirectory("rea-desktop-go-pyinstaller-");
+  const go = Buffer.from(
+    machoImage({
+      commands: [segmentWithSection("__DATA", "__go_buildinfo")],
+    }),
+  );
+  await putExecutable(root, "App.app/Contents/Resources/bin/backend", go);
+  // A dylib declaring the same section is not a main executable.
+  await put(
+    root,
+    "App.app/Contents/Frameworks/libgo.dylib",
+    Buffer.from(
+      machoImage({
+        fileType: FILE_TYPE.dylib,
+        commands: [segmentWithSection("__DATA", "__go_buildinfo")],
+      }),
+    ),
+  );
+  // Signed Mach-O: the archive ends before the 16-byte-aligned signature.
+  const header = Buffer.from(machoImage({ commands: [codeSignatureAt(0)] }));
+  const payload = Buffer.alloc(200);
+  const unsignedLength = header.length + payload.length + 88;
+  const signatureOffset = Math.ceil(unsignedLength / 16) * 16;
+  const signed = Buffer.concat([
+    header,
+    payload,
+    pyInstallerCookie(payload.length + 88),
+    Buffer.alloc(signatureOffset - unsignedLength),
+    Buffer.alloc(32, 0xfa),
+  ]);
+  codeSignatureAt(signatureOffset).copy(signed, 32);
+  await putExecutable(root, "App.app/Contents/Resources/bin/helper", signed);
+  // Unsigned ELF: the cookie ends the file.
+  const elf = elfExecutable();
+  await putExecutable(
+    root,
+    "linux/helper",
+    Buffer.concat([elf, Buffer.alloc(64), pyInstallerCookie(64 + 88)]),
+  );
+  // Names and stray magic bytes outside the declared places prove nothing.
+  await put(root, "notes/__go_buildinfo.txt", "__go_buildinfo");
+  await put(
+    root,
+    "data/archive.bin",
+    Buffer.concat([pyInstallerCookie(88), Buffer.alloc(16)]),
+  );
+
+  const { report } = await inspect(root);
+  const facts = (path: string) =>
+    report.files.find((file) => file.path === path)?.facts ?? [];
+  expect(facts("App.app/Contents/Resources/bin/backend")).toContainEqual({
+    kind: "go-build-info-section",
+    offset: 32 + 72,
+    value: { segment: "__DATA", section: "__go_buildinfo" },
+  });
+  expect(facts("App.app/Contents/Frameworks/libgo.dylib")).not.toContainEqual(
+    expect.objectContaining({ kind: "go-build-info-section" }),
+  );
+  expect(facts("App.app/Contents/Resources/bin/helper")).toContainEqual({
+    kind: "pyinstaller-archive-cookie",
+    offset: header.length + payload.length,
+    value: {
+      archive_offset: header.length,
+      archive_bytes: payload.length + 88,
+      toc_bytes: 16,
+      python_version: 314,
+      python_library: "Python",
+      placement: "before-code-signature",
+    },
+  });
+  expect(facts("linux/helper")).toContainEqual(
+    expect.objectContaining({
+      kind: "pyinstaller-archive-cookie",
+      value: expect.objectContaining({ placement: "file-end" }),
+    }),
+  );
+  expect(facts("notes/__go_buildinfo.txt")).toEqual([]);
+  expect(facts("data/archive.bin")).toEqual([]);
+  expect(
+    report.next_probes.map((probe) => [
+      probe.operation,
+      probe.path.slice(root.length + 1),
+    ]),
+  ).toEqual([["inspect_go_binary", "App.app/Contents/Resources/bin/backend"]]);
+  const pyinstaller = report.candidates.filter(
+    (candidate) => candidate.family === "pyinstaller",
+  );
+  expect(pyinstaller).toHaveLength(1);
+  expect(pyinstaller[0]?.basis_file_ids).toHaveLength(2);
+});
+
+it("reports malformed Go and PyInstaller declarations as file issues", async () => {
+  const root = await createTestTempDirectory("rea-desktop-go-pyinstaller-bad-");
+  const truncated = Buffer.from(
+    machoImage({ commands: [segmentWithSection("__DATA", "__go_buildinfo")] }),
+  );
+  truncated.writeUInt32LE(3, 16); // declares more commands than the table holds
+  await putExecutable(root, "truncated", truncated);
+  const elf = elfExecutable();
+  // The cookie claims an archive longer than everything before it.
+  await putExecutable(
+    root,
+    "oversized",
+    Buffer.concat([elf, pyInstallerCookie(1_000_000)]),
+  );
+  const { report } = await inspect(root);
+  const file = (path: string) => report.files.find((row) => row.path === path);
+  // The section declared before the truncation stays as a partial fact.
+  expect(file("truncated")).toMatchObject({
+    read_status: "partial",
+    issues: ["Mach-O load command table ends before its declared count"],
+  });
+  expect(file("truncated")?.facts.map((fact) => fact.kind)).toEqual([
+    "native-image-header",
+    "go-build-info-section",
+  ]);
+  expect(file("oversized")).toMatchObject({
+    read_status: "partial",
+    issues: [
+      "PyInstaller cookie declares an archive or table of contents outside the file",
+    ],
+  });
+  expect(file("oversized")?.facts.map((fact) => fact.kind)).toEqual([
+    "native-image-header",
+  ]);
+  expect(report.candidates).toEqual([]);
 });
 
 it("does not promote filenames, arbitrary pak files or symlink targets into byte facts", async () => {
@@ -1140,7 +1314,7 @@ it("changes snapshot identity when probe limits change retained read ranges", as
       buildNativePeFixture(),
     );
   const partial = await inspect(root, { max_probe_bytes: 4096 });
-  const complete = await inspect(root, { max_probe_bytes: 8192 });
+  const complete = await inspect(root, { max_probe_bytes: 16_384 });
   expect(partial.report.coverage.status).toBe("partial");
   expect(complete.report.coverage.status).toBe("complete-within-scan");
   expect(partial.report.files.map((file) => file.file_id)).toEqual(
