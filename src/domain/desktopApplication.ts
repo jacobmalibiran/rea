@@ -14,6 +14,7 @@ export const desktopFamilySchema = z.enum([
   "godot",
   "gamemaker",
   "electron",
+  "pyinstaller",
 ]);
 export const inspectDesktopApplicationInputSchema = z.strictObject({
   path: absoluteLocalPathStringSchema,
@@ -77,6 +78,24 @@ const desktopFactSchema = z.discriminatedUnion("kind", [
     z.strictObject({
       container: z.literal("FORM"),
       first_chunk: z.literal("GEN8"),
+    }),
+  ),
+  fact(
+    "go-build-info-section",
+    z.strictObject({
+      segment: z.string(),
+      section: z.literal("__go_buildinfo"),
+    }),
+  ),
+  fact(
+    "pyinstaller-archive-cookie",
+    z.strictObject({
+      archive_offset: byteOffset,
+      archive_bytes: byteOffset,
+      toc_bytes: byteOffset,
+      python_version: byteOffset,
+      python_library: z.string(),
+      placement: z.enum(["file-end", "before-code-signature"]),
     }),
   ),
   z.strictObject({
@@ -154,6 +173,7 @@ export const desktopProbeSchema = z.strictObject({
   operation: z.enum([
     "inspect_managed_artifact",
     "inspect_il2cpp_metadata",
+    "inspect_go_binary",
     "open_binary",
     "analyze_javascript_application",
   ]),

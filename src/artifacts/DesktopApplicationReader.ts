@@ -249,6 +249,7 @@ const scanDirectory = async (
     "Child symlinks are not followed. Executable section-embedded PCKs without a trailer and encrypted contents remain unexamined.",
     "This is a sequence of stable entry observations, not an atomic snapshot of the entire directory.",
     "Unity reference decoding stops after a witness in each Data/Managed directory; other assemblies' references are unexamined. Header facts remain per-file.",
+    "Go build-info sections are read only from little-endian thin Mach-O main executables, and PyInstaller cookies only from executables (thin Mach-O, non-DLL PE, ELF with an entry point). ELF, PE and FAT Go builds, older PyInstaller cookies and Rust or Tauri applications are not identified.",
   ];
   try {
     for await (const entry of reader.entries(signal, {
