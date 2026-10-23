@@ -1094,27 +1094,19 @@ it.each([63, 64, 65, 10_000])(
     ] as const) {
       const result = projectAnalysisView(duplicatedParent, view);
       if (!result.ok) throw result.error;
+      // Limitations appear once; unknowns name only unresolved coverage.
+      expect(result.value.unknowns).toEqual([
+        "semantic_graph.coverage.status is unknown",
+      ]);
       if (count <= 65) {
         expect(result.value.limitations).toEqual(messages);
-        expect(result.value.unknowns).toEqual(
-          [...messages, "semantic_graph.coverage.status is unknown"].sort(),
-        );
       } else {
         const limitations = result.value.limitations;
-        const unknowns = result.value.unknowns;
         expect(limitations.length).toBeGreaterThan(65);
         expect(limitations.at(-1)).toBe(
           notice(
             count - limitations.length + 1,
             "limitations",
-            parent.evidenceId,
-          ),
-        );
-        expect(unknowns.length).toBeGreaterThan(65);
-        expect(unknowns.at(-1)).toBe(
-          notice(
-            count + 1 - unknowns.length + 1,
-            "unknowns",
             parent.evidenceId,
           ),
         );
@@ -1230,11 +1222,12 @@ it.each(["partial", "unknown"] as const)(
         });
       expect(result.value.unknowns).toEqual([
         "1 application graph unknowns remain in the parent Evidence.",
-        ...messages.slice(0, 65),
         `graph.coverage.status is ${status}`,
         "semantic_graph.coverage.status is unknown",
-        `1 additional unknowns omitted from this view; consult source parent Evidence ${parent.evidenceId} for the complete list (the caller-supplied record, or its retaining session).`,
       ]);
+      expect(result.value.limitations).toEqual(
+        expect.arrayContaining(messages.slice(0, 65)),
+      );
     }
   },
 );
