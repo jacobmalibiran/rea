@@ -695,6 +695,41 @@ it("completes a loaded module past a very large array without stack overflow", (
   expect(namespace.environment.completedAt).toBe(earliestReturn);
 });
 
+it("bounds property, member and unknown-member walks through long spread chains", () => {
+  // Each object spreads the previous one; walking the chain recursed once per
+  // link outside the evaluation depth budget and overflowed the call stack.
+  const links = 5_000;
+  const chain = Array.from(
+    { length: links },
+    (_, index) => `const o${String(index + 1)} = { ...o${String(index)} };`,
+  ).join("\n");
+  const { resolver, values } = inspectFixture(
+    `const o0 = { value: 1 };\n${chain}\ninspect(o${String(links)});`,
+  );
+  const [object] = values;
+  if (object?.kind !== "object") throw new Error("spread chain object missing");
+  expect(resolver.truncated).toBe(false);
+
+  // Past the nesting bound the read stays unknown and the cut is recorded.
+  expect(
+    symbolicVariants(resolver.property(object, "value")).map(
+      (variant) => variant.kind,
+    ),
+  ).toEqual(["unknown"]);
+  expect(resolver.truncated).toBe(true);
+  // A truncated member walk counts unknown members instead of proving none.
+  expect(resolver.members(object)).not.toContain("value");
+  expect(resolver.unknownMembers(object)).toBeGreaterThan(0);
+});
+
+it("still resolves properties through a short spread chain", () => {
+  const value = inspectOne(
+    `const o0 = { value: 1 }; const o1 = { ...o0 }; const o2 = { ...o1 };
+    inspect(o2.value);`,
+  );
+  expect(value).toEqual({ kind: "literal", value: 1 });
+});
+
 it("keeps async call objects truthy and unwraps only awaited results", () => {
   const values = inspectedValues(`async function flag(){return false;}
     inspect(flag()); inspect(!flag()); inspect(flag() ?? true);
