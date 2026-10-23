@@ -60,6 +60,8 @@ interface SymbolicReadBoundary {
 type SymbolicNamespace = Extract<SymbolicValue, { kind: "namespace" }>;
 
 const emptyEnvironment: SymbolicEnvironment = { values: new Map() };
+/** Nesting bound shared by evaluation, value walks and return flow. */
+const SYMBOLIC_DEPTH_LIMIT = 128;
 const isObjectPrototypeSetter = (
   property: t.ObjectMethod | t.ObjectProperty,
   name: string,
@@ -192,25 +194,47 @@ export class JavaScriptSymbolicBindings {
     environment?: SymbolicEnvironment,
   ): SymbolicValue {
     if (!input) return { kind: "literal", value: undefined };
-    if (--this.#remainingEvaluations < 0 || this.#depth >= 128) {
+    return this.#bounded(
+      () => symbolicUnknown("symbolic resource limit"),
+      () => {
+        const node = unwrapJavaScriptExpression(input).node;
+        const env = environment ?? this.environmentAt(node);
+        const cache =
+          this.#cache.get(env) ?? new WeakMap<t.Node, SymbolicValue>();
+        this.#cache.set(env, cache);
+        const cached = cache.get(node);
+        if (cached) return cached;
+        if (this.#active.has(node)) return symbolicUnknown("cyclic binding");
+        this.#active.add(node);
+        try {
+          const value = this.#evaluate(node, env);
+          cache.set(node, value);
+          return value;
+        } finally {
+          this.#active.delete(node);
+        }
+      },
+    );
+  }
+
+  /**
+   * Charge one step of evaluation or value walking against the shared work
+   * and nesting budget. Cached evaluations return immediately, so a value walk
+   * (property reads, member lists through spreads) must charge its own steps or
+   * a long acyclic chain recurses without bound.
+   */
+  #bounded<T>(limited: () => T, step: () => T): T {
+    if (
+      --this.#remainingEvaluations < 0 ||
+      this.#depth >= SYMBOLIC_DEPTH_LIMIT
+    ) {
       this.truncated = true;
-      return symbolicUnknown("symbolic resource limit");
+      return limited();
     }
-    const node = unwrapJavaScriptExpression(input).node;
-    const env = environment ?? this.environmentAt(node);
-    const cache = this.#cache.get(env) ?? new WeakMap<t.Node, SymbolicValue>();
-    this.#cache.set(env, cache);
-    const cached = cache.get(node);
-    if (cached) return cached;
-    if (this.#active.has(node)) return symbolicUnknown("cyclic binding");
-    this.#active.add(node);
     this.#depth += 1;
     try {
-      const value = this.#evaluate(node, env);
-      cache.set(node, value);
-      return value;
+      return step();
     } finally {
-      this.#active.delete(node);
       this.#depth -= 1;
     }
   }
@@ -294,13 +318,18 @@ export class JavaScriptSymbolicBindings {
   ): SymbolicValue {
     const active = this.#propertyActive.get(value) ?? new Set<string>();
     if (active.has(key)) return symbolicUnknown("cyclic property");
-    active.add(key);
-    this.#propertyActive.set(value, active);
-    try {
-      return this.#propertyValue(value, key, read);
-    } finally {
-      active.delete(key);
-    }
+    return this.#bounded(
+      () => symbolicUnknown("symbolic resource limit"),
+      () => {
+        active.add(key);
+        this.#propertyActive.set(value, active);
+        try {
+          return this.#propertyValue(value, key, read);
+        } finally {
+          active.delete(key);
+        }
+      },
+    );
   }
 
   #propertyValue(
@@ -439,12 +468,27 @@ export class JavaScriptSymbolicBindings {
         );
   }
 
+  /**
+   * Statically known member names. A walk cut short by the resource budget
+   * sets `truncated` and omits the unvisited part; `unknownMembers` counts
+   * that part as unknown, so a short list never proves absence.
+   */
   members(
     value: SymbolicValue,
     active = new Set<SymbolicValue>(),
   ): readonly string[] {
     if (active.has(value)) return [];
     active.add(value);
+    return this.#bounded(
+      () => [],
+      () => this.#members(value, active),
+    );
+  }
+
+  #members(
+    value: SymbolicValue,
+    active: Set<SymbolicValue>,
+  ): readonly string[] {
     if (value.kind === "union")
       return [...new Set(value.values.flatMap((v) => this.members(v, active)))];
     if (value.kind === "record") return [...value.values.keys()];
@@ -486,6 +530,13 @@ export class JavaScriptSymbolicBindings {
   ): number {
     if (active.has(value)) return 1;
     active.add(value);
+    return this.#bounded(
+      () => 1,
+      () => this.#unknownMembers(value, active),
+    );
+  }
+
+  #unknownMembers(value: SymbolicValue, active: Set<SymbolicValue>): number {
     if (value.kind === "union")
       return value.values.reduce(
         (sum, v) => sum + this.unknownMembers(v, active),
@@ -1192,7 +1243,7 @@ export class JavaScriptSymbolicBindings {
         ...(unresolvedFallthrough ? { conditionUnresolved: true } : {}),
       });
     for (const statement of statements) {
-      if (--this.#remainingEvaluations < 0 || depth >= 128) {
+      if (--this.#remainingEvaluations < 0 || depth >= SYMBOLIC_DEPTH_LIMIT) {
         this.truncated = true;
         return {
           values: [...possible, symbolicUnknown("symbolic resource limit")],
